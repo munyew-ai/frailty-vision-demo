@@ -203,6 +203,8 @@
     #feedback.good   { color: var(--green); }
     #feedback.prompt { color: var(--blue); }
     #feedback.lower  { color: var(--coral); }
+    #feedback.warn   { color: #d02c1f; animation: warnpulse 0.5s ease-in-out 3; }
+    @keyframes warnpulse { 50% { opacity: 0.35; } }
 
     /* ── State indicator ── */
     #state-indicator {
@@ -738,6 +740,22 @@ function processLandmarks(landmarks) {
 }
 
 function countingStep(hipY) {
+  // Descent-speed check: hips moving DOWN too quickly while coming from standing
+  const nowTs = performance.now();
+  if (lastHipY !== null && lastHipTs !== null) {
+    const dt = (nowTs - lastHipTs) / 1000;
+    if (dt > 0 && dt < 0.5) {
+      const downSpeed = (hipY - lastHipY) / dt; // positive = moving down
+      const descending = (machineState === STATES.STANDING || machineState === STATES.LOWERING);
+      if (descending && downSpeed > FAST_SIT_SPEED && !warnTimer) {
+        setFeedback("Too fast — lower yourself slowly", "warn");
+        tone(220, 0.18); tone(220, 0.18, 0.22); // low caution buzz
+        warnTimer = setTimeout(() => { warnTimer = null; }, 1800);
+      }
+    }
+  }
+  lastHipY = hipY; lastHipTs = nowTs;
+
   let rawTarget = null;
   if (hipY > sitThreshold)   rawTarget = "low";   // seated
   if (hipY < standThreshold) rawTarget = "high";  // standing
@@ -804,6 +822,10 @@ function candidateNext(rawTarget) {
 
 let armed = false; // set when properly seated; a rep fires on reaching STANDING while armed
 
+// Descent-speed guard: warn if sitting down too fast (fall-risk for elders)
+let lastHipY = null, lastHipTs = null, warnTimer = null;
+const FAST_SIT_SPEED = 0.35; // normalized hip-Y units per second
+
 function transitionTo(newState) {
   const prev = machineState;
   machineState = newState;
@@ -811,9 +833,9 @@ function transitionTo(newState) {
   if (newState === STATES.SITTING) {
     armed = true; // seated — next full stand will count
     if (prev === STATES.LOWERING || prev === STATES.STANDING) {
-      setFeedback("Seated — stand when ready", "prompt");
+      setFeedback("Seated — stand up when ready", "lower");
     } else {
-      setFeedback("Ready — stand when you're set", "prompt");
+      setFeedback("Stand up when you're ready", "lower");
     }
   }
 
@@ -835,20 +857,20 @@ function transitionTo(newState) {
 }
 
 function updateFeedback(hipY) {
-  if (goodRepTimer) return; // let "Good rep!" show briefly
+  if (goodRepTimer || warnTimer) return; // let "Good rep!" / warnings show briefly
 
   switch (machineState) {
     case STATES.IDLE:
       setFeedback("Sit down on your chair to begin", "prompt");
       break;
     case STATES.SITTING:
-      setFeedback("Ready — stand when you're set", "prompt");
+      setFeedback("Stand up when you're ready", "lower");
       break;
     case STATES.RISING:
-      setFeedback("Stand up fully", "prompt");
+      setFeedback("Stand up fully", "lower");
       break;
     case STATES.STANDING:
-      setFeedback("Now sit back down", "lower");
+      setFeedback("Now sit back down — slowly", "lower");
       break;
     case STATES.LOWERING:
       setFeedback("Lower slowly", "lower");
@@ -919,6 +941,8 @@ function resetStateAndCount() {
   pendingState  = null;
   armed         = false;
   clearTimeout(goodRepTimer); goodRepTimer = null;
+  clearTimeout(warnTimer); warnTimer = null;
+  lastHipY = null; lastHipTs = null;
   // Restart calibration for webcam mode; sample mode keeps fallback thresholds
   calibStartTs = null; calibAccum = 0; calibSamples = 0; calibProgress = 0; lastFitOk = false;
   if (activeMode === "webcam") {
