@@ -348,11 +348,11 @@
   </div>
 
   <div class="btn-row">
-    <button id="reset-btn">Reset Count</button>
+    <button id="reset-btn">Reset &amp; Recalibrate</button>
   </div>
 
   <div id="footer-note">
-    Stand and sit from a chair at a comfortable pace. Each full sit→stand→sit is one rep.
+    Setup: stand to fit the outline, then sit on your chair to calibrate. After that, each seated→stand counts one rep.
   </div>
 
 </div><!-- /#app -->
@@ -363,8 +363,11 @@ import { PoseLandmarker, FilesetResolver, DrawingUtils } from "@mediapipe/tasks-
 /* ─────────────────────────────────────────────────────────
    CONSTANTS & DOM REFS
 ───────────────────────────────────────────────────────── */
-const LEFT_HIP  = 23;
-const RIGHT_HIP = 24;
+const NOSE       = 0;
+const LEFT_HIP   = 23;
+const RIGHT_HIP  = 24;
+const LEFT_ANKLE = 27;
+const RIGHT_ANKLE= 28;
 
 // State machine states
 const STATES = Object.freeze({
@@ -375,9 +378,28 @@ const STATES = Object.freeze({
   LOWERING: "lowering",
 });
 
-// Thresholds (normalized Y — 0 = top of frame, 1 = bottom)
-const SIT_THRESHOLD  = 0.55;  // hip Y > 0.55 → sitting
-const STAND_THRESHOLD = 0.42; // hip Y < 0.42 → standing
+// Calibration phases: guide the user, then compute per-person thresholds
+const PHASES = Object.freeze({
+  SETUP_STAND: "setup-stand",  // fit body in outline while standing → capture standing hip Y
+  SETUP_SIT:   "setup-sit",    // sit on chair → capture seated hip Y
+  COUNTING:    "counting",     // calibrated; count reps
+});
+let phase = PHASES.SETUP_STAND;
+
+// Fallback thresholds (used in sample-video mode, no calibration possible)
+const DEFAULT_SIT_THRESHOLD   = 0.55;
+const DEFAULT_STAND_THRESHOLD = 0.42;
+
+// Per-person calibrated thresholds (set during setup)
+let sitThreshold   = DEFAULT_SIT_THRESHOLD;
+let standThreshold = DEFAULT_STAND_THRESHOLD;
+let standingHipY   = null;   // captured in SETUP_STAND
+let seatedHipY     = null;   // captured in SETUP_SIT
+let calibFrames    = 0;      // consecutive frames meeting the current setup condition
+let calibAccum     = 0;      // hipY accumulator for averaging
+const CALIB_HOLD_FRAMES = 20;   // ~0.7 s hold to confirm each setup pose
+const MIN_SIT_DROP      = 0.10; // hips must drop at least this (normalized) from standing to count as seated
+let lastFitOk      = false;  // whether body currently fits the outline (drawn each frame)
 
 // Debounce: require threshold to be held for N consecutive frames
 const DEBOUNCE_FRAMES = 5;
@@ -475,6 +497,8 @@ async function startWebcam() {
 function startSampleVideo() {
   stopCurrentMode();
   activeMode = "sample";
+  phase = PHASES.COUNTING;
+  sitThreshold = DEFAULT_SIT_THRESHOLD; standThreshold = DEFAULT_STAND_THRESHOLD;
   $sampleVideo.classList.add("active");
   $webcamVideo.classList.remove("active");
   clearStatus();
@@ -522,6 +546,12 @@ function startDetectionLoop(videoEl) {
 
     // Draw
     ctx.clearRect(0, 0, $canvas.width, $canvas.height);
+
+    // During setup, draw the positioning outline (webcam mode only)
+    if (activeMode === "webcam" && phase === PHASES.SETUP_STAND) {
+      drawBodyGuide(lastFitOk);
+    }
+
     if (results.landmarks && results.landmarks.length > 0) {
       const drawUtils = new DrawingUtils(ctx);
       for (const lms of results.landmarks) {
@@ -546,28 +576,127 @@ function startDetectionLoop(videoEl) {
 }
 
 /* ─────────────────────────────────────────────────────────
-   REP DETECTION STATE MACHINE
+   BODY-OUTLINE GUIDE (setup phase)
+───────────────────────────────────────────────────────── */
+function drawBodyGuide(fitOk) {
+  const w = $canvas.width, h = $canvas.height;
+  const color = fitOk ? "rgba(51,132,95,0.95)" : "rgba(243,198,79,0.95)";
+  const fill  = fitOk ? "rgba(51,132,95,0.12)" : "rgba(243,198,79,0.08)";
+
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.fillStyle   = fill;
+  ctx.lineWidth   = 3;
+  ctx.setLineDash([10, 8]);
+
+  // Head circle
+  const headR = h * 0.07;
+  const headX = w * 0.5, headY = h * 0.13;
+  ctx.beginPath();
+  ctx.arc(headX, headY, headR, 0, Math.PI * 2);
+  ctx.fill(); ctx.stroke();
+
+  // Torso + legs zone (rounded rect from shoulders to near-bottom)
+  const bx = w * 0.32, bw = w * 0.36;
+  const by = headY + headR + h * 0.015, bh = h * 0.92 - by;
+  const r = 18;
+  ctx.beginPath();
+  ctx.moveTo(bx + r, by);
+  ctx.arcTo(bx + bw, by,      bx + bw, by + bh, r);
+  ctx.arcTo(bx + bw, by + bh, bx,      by + bh, r);
+  ctx.arcTo(bx,      by + bh, bx,      by,      r);
+  ctx.arcTo(bx,      by,      bx + bw, by,      r);
+  ctx.closePath();
+  ctx.fill(); ctx.stroke();
+
+  ctx.restore();
+}
+
+// Does the standing body fit the outline? nose near top-centre, ankles near bottom.
+function bodyFitsGuide(landmarks) {
+  const nose = landmarks[NOSE];
+  const la = landmarks[LEFT_ANKLE], ra = landmarks[RIGHT_ANKLE];
+  if (!nose || !la || !ra) return false;
+  const ankleY = (la.y + ra.y) / 2;
+  const noseCentered = nose.x > 0.32 && nose.x < 0.68;
+  const noseHigh     = nose.y > 0.05 && nose.y < 0.24;
+  const anklesLow    = ankleY > 0.80;
+  return noseCentered && noseHigh && anklesLow;
+}
+
+/* ─────────────────────────────────────────────────────────
+   REP DETECTION — phase-aware
 ───────────────────────────────────────────────────────── */
 function processLandmarks(landmarks) {
-  // Average normalized Y for LEFT_HIP and RIGHT_HIP
   const leftHip  = landmarks[LEFT_HIP];
   const rightHip = landmarks[RIGHT_HIP];
   if (!leftHip || !rightHip) return;
 
   const hipY = (leftHip.y + rightHip.y) / 2;
-
-  // Update debug bar (0 = top, 1 = bottom → flip for display)
   $hipBar.style.width = (hipY * 100).toFixed(1) + "%";
 
-  // Determine raw target state from hipY
+  // Sample mode skips calibration (fixed fallback thresholds)
+  if (activeMode !== "webcam") {
+    countingStep(hipY);
+    return;
+  }
+
+  switch (phase) {
+    case PHASES.SETUP_STAND: {
+      lastFitOk = bodyFitsGuide(landmarks);
+      if (lastFitOk) {
+        calibFrames++; calibAccum += hipY;
+        setFeedback(`Hold it… ${Math.max(0, Math.ceil((CALIB_HOLD_FRAMES - calibFrames) / 10))}`, "prompt");
+        if (calibFrames >= CALIB_HOLD_FRAMES) {
+          standingHipY = calibAccum / calibFrames;
+          calibFrames = 0; calibAccum = 0;
+          phase = PHASES.SETUP_SIT;
+          setFeedback("Great! Now sit down on your chair", "prompt");
+        }
+      } else {
+        calibFrames = 0; calibAccum = 0;
+        setFeedback("Stand so your whole body fits the outline", "prompt");
+      }
+      $stateInd.textContent = `Setup 1/2: fit the outline | hipY: ${hipY.toFixed(3)}`;
+      return;
+    }
+
+    case PHASES.SETUP_SIT: {
+      const dropped = hipY > standingHipY + MIN_SIT_DROP;
+      if (dropped) {
+        calibFrames++; calibAccum += hipY;
+        setFeedback("Hold your seat…", "prompt");
+        if (calibFrames >= CALIB_HOLD_FRAMES) {
+          seatedHipY = calibAccum / calibFrames;
+          calibFrames = 0; calibAccum = 0;
+          // Personal thresholds: 30% into the range from each end
+          const range = seatedHipY - standingHipY;
+          standThreshold = standingHipY + range * 0.30; // hipY below → standing
+          sitThreshold   = seatedHipY  - range * 0.30;  // hipY above → seated
+          phase = PHASES.COUNTING;
+          machineState = STATES.SITTING;
+          setFeedback("Calibrated! Stand up to count your first rep", "good");
+        }
+      } else {
+        calibFrames = 0; calibAccum = 0;
+      }
+      $stateInd.textContent = `Setup 2/2: sit on the chair | hipY: ${hipY.toFixed(3)}`;
+      return;
+    }
+
+    case PHASES.COUNTING:
+      countingStep(hipY);
+      return;
+  }
+}
+
+function countingStep(hipY) {
   let rawTarget = null;
-  if (hipY > SIT_THRESHOLD)   rawTarget = "low";   // sitting
-  if (hipY < STAND_THRESHOLD) rawTarget = "high";  // standing
+  if (hipY > sitThreshold)   rawTarget = "low";   // seated
+  if (hipY < standThreshold) rawTarget = "high";  // standing
 
-  // Debounce: candidate must hold for DEBOUNCE_FRAMES consecutive frames
   applyDebounce(rawTarget, hipY);
-
-  $stateInd.textContent = `State: ${machineState} | hipY: ${hipY.toFixed(3)}`;
+  $stateInd.textContent = `State: ${machineState} | hipY: ${hipY.toFixed(3)} | stand<${standThreshold.toFixed(2)} sit>${sitThreshold.toFixed(2)}`;
 }
 
 function applyDebounce(rawTarget, hipY) {
@@ -626,31 +755,43 @@ function candidateNext(rawTarget) {
   }
 }
 
+let armed = false; // set when properly seated; a rep fires on reaching STANDING while armed
+
 function transitionTo(newState) {
   const prev = machineState;
   machineState = newState;
 
-  // A rep is completed when we return to sitting after having been standing
-  if ((prev === STATES.LOWERING || prev === STATES.STANDING) && newState === STATES.SITTING) {
+  if (newState === STATES.SITTING) {
+    armed = true; // seated — next full stand will count
+    if (prev === STATES.LOWERING || prev === STATES.STANDING) {
+      setFeedback("Seated — stand when ready", "prompt");
+    } else {
+      setFeedback("Ready — stand when you're set", "prompt");
+    }
+  }
+
+  // Rep clocks the moment full standing is reached from a seated start
+  if (newState === STATES.STANDING && armed) {
+    armed = false;
     repCount++;
     $repCount.textContent = repCount;
     triggerRepAnimation();
-    setFeedback("Good rep!", "good");
+    setFeedback("Good rep! Now sit back down", "good");
     clearTimeout(goodRepTimer);
-    goodRepTimer = setTimeout(() => setFeedback("Keep going!", "prompt"), 2000);
-  } else if (newState === STATES.IDLE) {
+    goodRepTimer = setTimeout(() => { goodRepTimer = null; }, 2000);
+  }
+
+  if (newState === STATES.IDLE) {
     setFeedback("Waiting for pose…", "");
-  } else if (newState === STATES.SITTING) {
-    setFeedback("Ready — stand when you're set", "prompt");
   }
 }
 
 function updateFeedback(hipY) {
-  if (goodRepTimer && machineState === STATES.SITTING) return; // show "Good rep!" briefly
+  if (goodRepTimer) return; // let "Good rep!" show briefly
 
   switch (machineState) {
     case STATES.IDLE:
-      setFeedback("Step into frame and sit down to begin", "prompt");
+      setFeedback("Sit down on your chair to begin", "prompt");
       break;
     case STATES.SITTING:
       setFeedback("Ready — stand when you're set", "prompt");
@@ -704,9 +845,20 @@ function resetStateAndCount() {
   machineState = STATES.IDLE;
   debounceCount = 0;
   pendingState  = null;
-  clearTimeout(goodRepTimer);
+  armed         = false;
+  clearTimeout(goodRepTimer); goodRepTimer = null;
+  // Restart calibration for webcam mode; sample mode keeps fallback thresholds
+  calibFrames = 0; calibAccum = 0; lastFitOk = false;
+  if (activeMode === "webcam") {
+    phase = PHASES.SETUP_STAND;
+    standingHipY = null; seatedHipY = null;
+    sitThreshold = DEFAULT_SIT_THRESHOLD; standThreshold = DEFAULT_STAND_THRESHOLD;
+    setFeedback("Stand so your whole body fits the outline", "prompt");
+  } else {
+    phase = PHASES.COUNTING;
+    setFeedback("Waiting for pose…", "");
+  }
   $repCount.textContent = "0";
-  setFeedback("Waiting for pose…", "");
   $stateInd.textContent = "State: idle";
 }
 
