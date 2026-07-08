@@ -718,11 +718,12 @@ function processLandmarks(landmarks) {
           calibStartTs = null;
           // Personal thresholds: 30% into the range from each end
           const range = seatedHipY - standingHipY;
-          standThreshold = standingHipY + range * 0.30; // hipY below → standing
-          sitThreshold   = seatedHipY  - range * 0.30;  // hipY above → seated
+          standThreshold = standingHipY + range * 0.25; // hipY below → standing
+          sitThreshold   = seatedHipY  - range * 0.40;  // hipY above → seated
           phase = PHASES.COUNTING;
           machineState = STATES.SITTING;
           armed = true;
+          seatedSince = performance.now();
           chimeSuccess();
           setFeedback("Calibrated! Stand up to count your first rep", "good");
         }
@@ -740,21 +741,20 @@ function processLandmarks(landmarks) {
 }
 
 function countingStep(hipY) {
-  // Descent-speed check: hips moving DOWN too quickly while coming from standing
+  // Descent-speed check over a rolling ~400 ms window (state-independent)
   const nowTs = performance.now();
-  if (lastHipY !== null && lastHipTs !== null) {
-    const dt = (nowTs - lastHipTs) / 1000;
-    if (dt > 0 && dt < 0.5) {
-      const downSpeed = (hipY - lastHipY) / dt; // positive = moving down
-      const descending = (machineState === STATES.STANDING || machineState === STATES.LOWERING);
-      if (descending && downSpeed > FAST_SIT_SPEED && !warnTimer) {
-        setFeedback("Too fast — lower yourself slowly", "warn");
-        tone(220, 0.18); tone(220, 0.18, 0.22); // low caution buzz
-        warnTimer = setTimeout(() => { warnTimer = null; }, 1800);
-      }
+  hipHist.push({ t: nowTs, y: hipY });
+  while (hipHist.length > 1 && nowTs - hipHist[0].t > 400) hipHist.shift();
+  if (hipHist.length >= 3 && !warnTimer) {
+    const oldest = hipHist[0];
+    const dt = (nowTs - oldest.t) / 1000;
+    const drop = hipY - oldest.y;              // positive = moved down
+    if (dt > 0.15 && drop > FAST_SIT_MIN_DROP && (drop / dt) > FAST_SIT_SPEED) {
+      setFeedback("Too fast — lower yourself slowly", "warn");
+      tone(220, 0.18); tone(220, 0.18, 0.22); // low caution buzz
+      warnTimer = setTimeout(() => { warnTimer = null; }, 1800);
     }
   }
-  lastHipY = hipY; lastHipTs = nowTs;
 
   let rawTarget = null;
   if (hipY > sitThreshold)   rawTarget = "low";   // seated
@@ -823,8 +823,14 @@ function candidateNext(rawTarget) {
 let armed = false; // set when properly seated; a rep fires on reaching STANDING while armed
 
 // Descent-speed guard: warn if sitting down too fast (fall-risk for elders)
-let lastHipY = null, lastHipTs = null, warnTimer = null;
-const FAST_SIT_SPEED = 0.35; // normalized hip-Y units per second
+let hipHist = [];            // rolling window of {t, y} samples (~400 ms)
+let warnTimer = null;
+const FAST_SIT_SPEED = 0.30; // normalized hip-Y units per second (over the window)
+const FAST_SIT_MIN_DROP = 0.05; // must actually be moving down, not jitter
+
+// Seated-too-long nudge
+let seatedSince = null;
+const STAND_NUDGE_MS = 5000; // after 5 s seated, prompt to stand in red
 
 function transitionTo(newState) {
   const prev = machineState;
@@ -832,6 +838,7 @@ function transitionTo(newState) {
 
   if (newState === STATES.SITTING) {
     armed = true; // seated — next full stand will count
+    seatedSince = performance.now();
     if (prev === STATES.LOWERING || prev === STATES.STANDING) {
       setFeedback("Seated — stand up when ready", "lower");
     } else {
@@ -864,7 +871,11 @@ function updateFeedback(hipY) {
       setFeedback("Sit down on your chair to begin", "prompt");
       break;
     case STATES.SITTING:
-      setFeedback("Stand up when you're ready", "lower");
+      if (seatedSince && performance.now() - seatedSince > STAND_NUDGE_MS) {
+        setFeedback("Time to stand up!", "warn");
+      } else {
+        setFeedback("Stand up when you're ready", "lower");
+      }
       break;
     case STATES.RISING:
       setFeedback("Stand up fully", "lower");
@@ -942,7 +953,7 @@ function resetStateAndCount() {
   armed         = false;
   clearTimeout(goodRepTimer); goodRepTimer = null;
   clearTimeout(warnTimer); warnTimer = null;
-  lastHipY = null; lastHipTs = null;
+  hipHist = []; seatedSince = null;
   // Restart calibration for webcam mode; sample mode keeps fallback thresholds
   calibStartTs = null; calibAccum = 0; calibSamples = 0; calibProgress = 0; lastFitOk = false;
   if (activeMode === "webcam") {
