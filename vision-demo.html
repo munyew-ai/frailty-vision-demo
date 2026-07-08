@@ -395,9 +395,12 @@ let sitThreshold   = DEFAULT_SIT_THRESHOLD;
 let standThreshold = DEFAULT_STAND_THRESHOLD;
 let standingHipY   = null;   // captured in SETUP_STAND
 let seatedHipY     = null;   // captured in SETUP_SIT
-let calibFrames    = 0;      // consecutive frames meeting the current setup condition
+let calibStartTs   = null;   // when the current hold began (ms)
 let calibAccum     = 0;      // hipY accumulator for averaging
-const CALIB_HOLD_FRAMES = 20;   // ~0.7 s hold to confirm each setup pose
+let calibSamples   = 0;
+let calibProgress  = 0;      // 0..1 hold progress (drawn as a bar)
+const CALIB_STAND_MS = 2000; // hold the outline for 2.0 s
+const CALIB_SIT_MS   = 1500; // hold the seat for 1.5 s
 const MIN_SIT_DROP      = 0.10; // hips must drop at least this (normalized) from standing to count as seated
 let lastFitOk      = false;  // whether body currently fits the outline (drawn each frame)
 
@@ -580,34 +583,67 @@ function startDetectionLoop(videoEl) {
 ───────────────────────────────────────────────────────── */
 function drawBodyGuide(fitOk) {
   const w = $canvas.width, h = $canvas.height;
-  const color = fitOk ? "rgba(51,132,95,0.95)" : "rgba(243,198,79,0.95)";
-  const fill  = fitOk ? "rgba(51,132,95,0.12)" : "rgba(243,198,79,0.08)";
+  const stroke = fitOk ? "#33845f" : "#f3c64f";
+
+  // Geometry
+  const headR = h * 0.075;
+  const headX = w * 0.5, headY = h * 0.13;
+  const bx = w * 0.30, bw = w * 0.40;
+  const by = headY + headR + h * 0.012, bh = h * 0.93 - by;
+  const r = 22;
+
+  const bodyPath = () => {
+    ctx.beginPath();
+    ctx.arc(headX, headY, headR, 0, Math.PI * 2);
+    ctx.moveTo(bx + r, by);
+    ctx.arcTo(bx + bw, by,      bx + bw, by + bh, r);
+    ctx.arcTo(bx + bw, by + bh, bx,      by + bh, r);
+    ctx.arcTo(bx,      by + bh, bx,      by,      r);
+    ctx.arcTo(bx,      by,      bx + bw, by,      r);
+    ctx.closePath();
+  };
 
   ctx.save();
-  ctx.strokeStyle = color;
-  ctx.fillStyle   = fill;
-  ctx.lineWidth   = 3;
-  ctx.setLineDash([10, 8]);
 
-  // Head circle
-  const headR = h * 0.07;
-  const headX = w * 0.5, headY = h * 0.13;
-  ctx.beginPath();
-  ctx.arc(headX, headY, headR, 0, Math.PI * 2);
-  ctx.fill(); ctx.stroke();
+  // 1) Dark scrim over everything, with the body zone cut out → outline pops
+  ctx.fillStyle = "rgba(0, 25, 20, 0.55)";
+  ctx.fillRect(0, 0, w, h);
+  ctx.globalCompositeOperation = "destination-out";
+  bodyPath();
+  ctx.fill();
+  ctx.globalCompositeOperation = "source-over";
 
-  // Torso + legs zone (rounded rect from shoulders to near-bottom)
-  const bx = w * 0.32, bw = w * 0.36;
-  const by = headY + headR + h * 0.015, bh = h * 0.92 - by;
-  const r = 18;
-  ctx.beginPath();
-  ctx.moveTo(bx + r, by);
-  ctx.arcTo(bx + bw, by,      bx + bw, by + bh, r);
-  ctx.arcTo(bx + bw, by + bh, bx,      by + bh, r);
-  ctx.arcTo(bx,      by + bh, bx,      by,      r);
-  ctx.arcTo(bx,      by,      bx + bw, by,      r);
-  ctx.closePath();
-  ctx.fill(); ctx.stroke();
+  // 2) Bold outline (double stroke: dark halo + bright dashed line)
+  bodyPath();
+  ctx.lineWidth = 9;
+  ctx.strokeStyle = "rgba(0,0,0,0.35)";
+  ctx.setLineDash([]);
+  ctx.stroke();
+  bodyPath();
+  ctx.lineWidth = 5;
+  ctx.strokeStyle = stroke;
+  ctx.setLineDash([16, 10]);
+  ctx.stroke();
+
+  // 3) On-canvas instruction label
+  ctx.setLineDash([]);
+  ctx.font = `bold ${Math.max(16, Math.round(h * 0.032))}px Inter, sans-serif`;
+  ctx.textAlign = "center";
+  const label = fitOk ? "Hold still\u2026" : "Fit your whole body inside the outline";
+  const ly = h * 0.045;
+  ctx.lineWidth = 5; ctx.strokeStyle = "rgba(0,0,0,0.6)";
+  ctx.strokeText(label, w / 2, ly);
+  ctx.fillStyle = "#ffffff";
+  ctx.fillText(label, w / 2, ly);
+
+  // 4) Hold-progress bar (fills while you hold the pose)
+  if (fitOk && calibProgress > 0) {
+    const pbW = w * 0.5, pbH = 10, pbX = (w - pbW) / 2, pbY = h * 0.965 - pbH;
+    ctx.fillStyle = "rgba(255,255,255,0.25)";
+    ctx.fillRect(pbX, pbY, pbW, pbH);
+    ctx.fillStyle = "#33845f";
+    ctx.fillRect(pbX, pbY, pbW * Math.min(1, calibProgress), pbH);
+  }
 
   ctx.restore();
 }
@@ -645,16 +681,22 @@ function processLandmarks(landmarks) {
     case PHASES.SETUP_STAND: {
       lastFitOk = bodyFitsGuide(landmarks);
       if (lastFitOk) {
-        calibFrames++; calibAccum += hipY;
-        setFeedback(`Hold it… ${Math.max(0, Math.ceil((CALIB_HOLD_FRAMES - calibFrames) / 10))}`, "prompt");
-        if (calibFrames >= CALIB_HOLD_FRAMES) {
-          standingHipY = calibAccum / calibFrames;
-          calibFrames = 0; calibAccum = 0;
+        const now = performance.now();
+        if (calibStartTs === null) { calibStartTs = now; calibAccum = 0; calibSamples = 0; }
+        calibAccum += hipY; calibSamples++;
+        const held = now - calibStartTs;
+        calibProgress = held / CALIB_STAND_MS;
+        const remain = Math.max(0, Math.ceil((CALIB_STAND_MS - held) / 1000));
+        setFeedback(`Hold still… ${remain}`, "prompt");
+        if (held >= CALIB_STAND_MS) {
+          standingHipY = calibAccum / calibSamples;
+          calibStartTs = null; calibProgress = 0;
           phase = PHASES.SETUP_SIT;
-          setFeedback("Great! Now sit down on your chair", "prompt");
+          chimeStep();
+          setFeedback("Great! Now sit down on your chair", "good");
         }
       } else {
-        calibFrames = 0; calibAccum = 0;
+        calibStartTs = null; calibProgress = 0;
         setFeedback("Stand so your whole body fits the outline", "prompt");
       }
       $stateInd.textContent = `Setup 1/2: fit the outline | hipY: ${hipY.toFixed(3)}`;
@@ -664,21 +706,26 @@ function processLandmarks(landmarks) {
     case PHASES.SETUP_SIT: {
       const dropped = hipY > standingHipY + MIN_SIT_DROP;
       if (dropped) {
-        calibFrames++; calibAccum += hipY;
+        const now = performance.now();
+        if (calibStartTs === null) { calibStartTs = now; calibAccum = 0; calibSamples = 0; }
+        calibAccum += hipY; calibSamples++;
+        const held = now - calibStartTs;
         setFeedback("Hold your seat…", "prompt");
-        if (calibFrames >= CALIB_HOLD_FRAMES) {
-          seatedHipY = calibAccum / calibFrames;
-          calibFrames = 0; calibAccum = 0;
+        if (held >= CALIB_SIT_MS) {
+          seatedHipY = calibAccum / calibSamples;
+          calibStartTs = null;
           // Personal thresholds: 30% into the range from each end
           const range = seatedHipY - standingHipY;
           standThreshold = standingHipY + range * 0.30; // hipY below → standing
           sitThreshold   = seatedHipY  - range * 0.30;  // hipY above → seated
           phase = PHASES.COUNTING;
           machineState = STATES.SITTING;
+          armed = true;
+          chimeSuccess();
           setFeedback("Calibrated! Stand up to count your first rep", "good");
         }
       } else {
-        calibFrames = 0; calibAccum = 0;
+        calibStartTs = null;
       }
       $stateInd.textContent = `Setup 2/2: sit on the chair | hipY: ${hipY.toFixed(3)}`;
       return;
@@ -775,6 +822,7 @@ function transitionTo(newState) {
     armed = false;
     repCount++;
     $repCount.textContent = repCount;
+    beepRep();
     triggerRepAnimation();
     setFeedback("Good rep! Now sit back down", "good");
     clearTimeout(goodRepTimer);
@@ -807,6 +855,30 @@ function updateFeedback(hipY) {
       break;
   }
 }
+
+/* AUDIO CHIMES (Web Audio — no files needed) */
+let audioCtx = null;
+function ensureAudio() {
+  if (!audioCtx) {
+    try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch (_) {}
+  }
+  if (audioCtx && audioCtx.state === "suspended") audioCtx.resume();
+}
+function tone(freq, dur = 0.15, delay = 0, vol = 0.25) {
+  if (!audioCtx) return;
+  const t = audioCtx.currentTime + delay;
+  const o = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  o.type = "sine"; o.frequency.value = freq;
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(vol, t + 0.02);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g).connect(audioCtx.destination);
+  o.start(t); o.stop(t + dur + 0.05);
+}
+function chimeStep()    { tone(660, 0.12); }
+function chimeSuccess() { tone(660, 0.12); tone(880, 0.2, 0.14); }
+function beepRep()      { tone(880, 0.12); }
 
 /* ─────────────────────────────────────────────────────────
    UI HELPERS
@@ -848,7 +920,7 @@ function resetStateAndCount() {
   armed         = false;
   clearTimeout(goodRepTimer); goodRepTimer = null;
   // Restart calibration for webcam mode; sample mode keeps fallback thresholds
-  calibFrames = 0; calibAccum = 0; lastFitOk = false;
+  calibStartTs = null; calibAccum = 0; calibSamples = 0; calibProgress = 0; lastFitOk = false;
   if (activeMode === "webcam") {
     phase = PHASES.SETUP_STAND;
     standingHipY = null; seatedHipY = null;
@@ -866,11 +938,13 @@ function resetStateAndCount() {
    EVENT LISTENERS
 ───────────────────────────────────────────────────────── */
 $webcamBtn.addEventListener("click", () => {
+  ensureAudio();
   if (!poseLandmarker) { showStatus("Model still loading — please wait.", false); return; }
   startWebcam();
 });
 
 $sampleBtn.addEventListener("click", () => {
+  ensureAudio();
   if (!poseLandmarker) { showStatus("Model still loading — please wait.", false); return; }
   startSampleVideo();
 });
